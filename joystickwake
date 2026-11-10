@@ -29,6 +29,8 @@ import signal
 import sys
 import time
 
+import struct
+
 try:
     import dbus_fast
     import dbus_fast.aio
@@ -347,6 +349,7 @@ class JoystickWatcher:
         # The evdev & joydev nodes for the same joystick will share a parent,
         # so mapping devices by their parent lets us avoid watching both.
         self._devinfo_by_parent = {}  # device parent -> (name, file descriptor)
+        self._last_axes = {}          # (fd, axis_number) -> last_value
         self._context = pyudev.Context()
         self._monitor = pyudev.Monitor.from_netlink(self._context)
         self._monitor.filter_by(subsystem='input')
@@ -500,7 +503,11 @@ class JoystickWatcher:
             return
 
         del self._devinfo_by_parent[device.parent]
+        
+        self._last_axes = {k: v for k, v in self._last_axes.items() if k[0] != devinfo.fd}
+        
         asyncio.get_event_loop().remove_reader(devinfo.fd)
+           
         try:
             os.close(devinfo.fd)
         except OSError as error:
@@ -509,19 +516,69 @@ class JoystickWatcher:
 
         self._log.info("%s removed from the system", device.sys_name)
 
+    #def _read_fd(self, devinfo):
+    #    #Read data from a device.
+    #    #This is called when a device node's file descriptor becomes readable.
+        
+    #    # Read enough for many evdev events (analog sticks can produce a lot).
+    #    try:
+    #        os.read(devinfo.fd, 960)
+    #        self._log.debug("%s activity", devinfo.name)
+    #        self._wake_screen()
+    #    except OSError as error:
+    #        if error.errno != errno.ENODEV:
+    #            raise
+    #        asyncio.get_event_loop().remove_reader(devinfo.fd)
+    
     def _read_fd(self, devinfo):
         """Read data from a device.
         This is called when a device node's file descriptor becomes readable.
         """
-        # Read enough for many evdev events (analog sticks can produce a lot).
+        delta_threshold = 8192  # 32767
+
         try:
-            os.read(devinfo.fd, 960)
-            self._log.debug("%s activity", devinfo.name)
-            self._wake_screen()
+            data = os.read(devinfo.fd, 960)
         except OSError as error:
             if error.errno != errno.ENODEV:
                 raise
+            self._last_axes = {k: v for k, v in self._last_axes.items() if k[0] != devinfo.fd}
             asyncio.get_event_loop().remove_reader(devinfo.fd)
+            return
+
+        # Fallback if using evdev instead of js*
+        if not devinfo.name.startswith('js'):
+            if data:
+                self._log.debug("%s activity", devinfo.name)
+                self._wake_screen()
+            return
+
+        active = False
+        for offset in range(0, len(data) - (len(data) % 8), 8):
+            _, value, ev_type, number = struct.unpack_from('IhBB', data, offset)
+            key = (devinfo.fd, number)
+
+            # Record initial axis positions on connect without waking
+            if ev_type & 0x80:
+                if (ev_type & ~0x80) == 0x02:
+                    self._last_axes[key] = value
+                continue
+
+            if ev_type == 0x01:  # Button press/release
+                active = True
+                break
+
+            if ev_type == 0x02:  # Axis movement
+                prev = self._last_axes.get(key)
+                if prev is not None and abs(value - prev) >= delta_threshold:
+                    self._last_axes[key] = value
+                    active = True
+                    break
+                if prev is None:
+                    self._last_axes[key] = value
+
+        if active:
+            self._log.debug("%s activity", devinfo.name)
+            self._wake_screen()
 
     def _wake_screen(self):
         """Wake the screen if we haven't done so recently.
